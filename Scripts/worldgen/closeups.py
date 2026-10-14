@@ -1,7 +1,8 @@
 """Street-level close-ups of one example level, for judging facades and props.
 
     exec(open(r"C:/Users/waemf/data/ramms/Scripts/worldgen/closeups.py").read())
-Set CLOSEUP_MAP / CLOSEUP_VIEWS before exec to change the level or the camera list.
+Set CLOSEUP_MAP / CLOSEUP_VIEWS before exec to change the level or the camera list; CLOSEUP_NO_LOAD = True
+shoots the level that is already open (e.g. freshly regenerated) instead of reloading it from disk.
 Screenshots: Saved/Screenshots/WindowsEditor/Close_<Map>_<n>.png
 """
 import time
@@ -37,7 +38,8 @@ def tick(dt):
     st["busy"] = True
     try:
         if st["phase"] == "load":
-            unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).load_level(MAP)
+            if not globals().get("CLOSEUP_NO_LOAD"):
+                unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).load_level(MAP)
             st["phase"] = "cam"; st["until"] = time.time() + 3.0
         elif st["phase"] == "cam":
             if st["i"] >= len(VIEWS):
