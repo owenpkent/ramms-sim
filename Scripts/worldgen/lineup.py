@@ -4,7 +4,8 @@ with a red marker in front of each, and screenshot them from the front.
     LINEUP = ["Furniture.TV", "Furniture.Sofa"]
     exec(open(r"C:/Users/waemf/data/ramms/Scripts/worldgen/lineup.py").read())
 
-LINEUP_ONLY = {"SM_TV"} limits it to some meshes; LINEUP_CAM_YAW = 90 looks from +Y instead of +X.
+LINEUP_ONLY = {"SM_TV"} limits it to some meshes; LINEUP_CAM_YAW = 90 looks from +Y instead of +X;
+LINEUP_PALETTE = "/RammsWorldGen/Palettes/PAL_UrbanVerse" lines up another palette.
 A mesh whose back (or side) faces the camera has a wrong facing. Screenshots:
 Saved/Screenshots/WindowsEditor/Lineup_<slot>_<n>.png (3 meshes per shot, +Y to the left), names in Saved/WorldGen/lineup.json.
 """
@@ -14,7 +15,7 @@ import unreal
 
 
 def _lineup_rows(slots):
-    pal = unreal.load_asset("/RammsWorldGen/Palettes/PAL_Default")
+    pal = unreal.load_asset(_PALETTE[0])
     smap = pal.get_editor_property("slots")
     rows = []
     for si, slot in enumerate(slots):
@@ -27,8 +28,29 @@ def _lineup_rows(slots):
     return rows
 
 
+LINEUP_LEVEL = "/Game/Maps/Gen/Map_Gen_Indoor"
+
+
 def _start_lineup(slots, top, only=(), cam_yaw=0):
-    s = {"phase": "level", "until": 0.0, "i": 0, "handle": None, "views": [], "names": {}}
+    import os
+    s = {"phase": "build", "until": 0.0, "i": 0, "handle": None, "views": [], "names": {}}
+    # Load the stage level here, not from the tick callback: loading from a slate tick (above all with a dirty
+    # level open) has crashed the editor. A dirty level is left alone rather than discarded.
+    try:
+        dirty = [p.get_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages()]
+    except Exception:  # noqa: BLE001
+        dirty = []
+    # (An earlier lineup's leftovers in the stage level itself are fine to drop.)
+    dirty = [d for d in dirty if d != LINEUP_LEVEL]
+    if dirty:
+        unreal.log_warning("[lineup] the open level has unsaved changes (%s); save or revert it first" % ", ".join(dirty))
+        return
+    if not unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).load_level(LINEUP_LEVEL):
+        unreal.log_warning("[lineup] could not load %s" % LINEUP_LEVEL)
+        return
+    os.makedirs(os.path.join(unreal.Paths.project_saved_dir(), "WorldGen"), exist_ok=True)
+    os.makedirs(os.path.join(unreal.SystemLibrary.get_project_saved_directory(), "Screenshots", "WindowsEditor"), exist_ok=True)
+    s["until"] = time.time() + 3.0
     eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 
     def spawn(cls, loc, rot=unreal.Rotator(0, 0, 0)):
@@ -111,12 +133,8 @@ def _start_lineup(slots, top, only=(), cam_yaw=0):
         if time.time() < s["until"]:
             return
         try:
-            if s["phase"] == "level":
-                # Built far from the origin of a freshly loaded level (new_level crashes from a tick callback);
-                # nothing is saved.
-                unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).load_level("/Game/Maps/Gen/Map_Gen_Indoor")
-                s["phase"] = "build"; s["until"] = time.time() + 3.0
-            elif s["phase"] == "build":
+            if s["phase"] == "build":
+                # Built far from the origin of the freshly loaded level; nothing is saved.
                 build()
                 s["phase"] = "cam"; s["until"] = time.time() + 5.0
             elif s["phase"] == "cam":
@@ -137,7 +155,8 @@ def _start_lineup(slots, top, only=(), cam_yaw=0):
     s["handle"] = unreal.register_slate_post_tick_callback(tick)
 
 
+_PALETTE = [globals().get("LINEUP_PALETTE", "/RammsWorldGen/Palettes/PAL_Default")]
 _start_lineup(list(globals().get("LINEUP", ["Furniture.TV"])), bool(globals().get("LINEUP_TOP", False)),
               set(globals().get("LINEUP_ONLY", ())), float(globals().get("LINEUP_CAM_YAW", 0.0)))
-for _k in ("LINEUP", "LINEUP_TOP", "LINEUP_ONLY", "LINEUP_CAM_YAW"):
+for _k in ("LINEUP", "LINEUP_TOP", "LINEUP_ONLY", "LINEUP_CAM_YAW", "LINEUP_PALETTE"):
     globals().pop(_k, None)
