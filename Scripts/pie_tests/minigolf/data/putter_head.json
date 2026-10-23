@@ -1,0 +1,19 @@
+{
+ "rel_pos": [
+  0.3316,
+  -74.7182,
+  -25.6911
+ ],
+ "rel_quat": [
+  0.545453,
+  -0.441427,
+  -0.453816,
+  -0.549249
+ ],
+ "size": [
+  10.0,
+  2.5,
+  2.0
+ ],
+ "note": "Putter head box relative to the Gen3's bracelet_link, measured with the arm at the stroke's frame-72 (address) pose. rel_pos is UE cm in the bracelet's frame, rel_quat is UE (x, y, z, w), size is the full box size in cm (toe, thickness, height). The face is yawed -3.9 deg about world Z at address so the struck ball leaves straight: the first recording, without the yaw, pulled 3.9 deg."
+}
