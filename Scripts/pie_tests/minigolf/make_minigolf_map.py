@@ -19,6 +19,14 @@ running; they are consumed and cleared on read, so they apply to exactly one run
     unreal._ramms_minigolf_base_yaw  yaw in degrees of the Gen3 Blueprint at the mount
     unreal._ramms_minigolf_friction  [slide, torsion, roll] for the green and the ball,
                                      in MuJoCo units
+    unreal._ramms_minigolf_gen3_bp   the Gen3 Blueprint (default the fixed-base one;
+                                     /Game/Robots/URL/gen3_2f85 has a free base welded to
+                                     a mocap body, which the chair-assist stroke slides)
+    unreal._ramms_minigolf_contact   {"solref": [timeconst, dampratio], "solimp": [...]}
+                                     applied to the ball and the putter head geoms
+    unreal._ramms_minigolf_timestep  the manager's scene_option timestep in seconds
+    unreal._ramms_minigolf_wall_solref   [timeconst, dampratio] for walls and cup liner
+    unreal._ramms_minigolf_wall_friction [slide, torsion, roll] for walls and cup liner
 
 Run inside the editor (run_minigolf.py map does this and passes the parameters):
     python3 Scripts/editor_remote_exec.py --file Scripts/pie_tests/minigolf/make_minigolf_map.py
@@ -57,9 +65,20 @@ PUTTER = take_param("putter", None)
 MOUNT = tuple(take_param("mount", (-35.0, -8.0, 35.0)))
 BASE_YAW = float(take_param("base_yaw", -90.0))
 FRICTION = take_param("friction", [0.6, 0.005, 0.00135])   # rolling 0.00135 is about 0.5 m/s^2 on a kicked ball
-GEN3_BP = "/Game/Robots/URL/gen3_2f85_fixed"
+GEN3_BP = take_param("gen3_bp", "/Game/Robots/URL/gen3_2f85_fixed")
+CONTACT = take_param("contact", None)
+TIMESTEP = take_param("timestep", None)
+# Walls bounce and are slippery. MuJoCo's default solref (0.02, 1) is critically damped
+# and swallowed a 2 m/s bank shot; 0.004 is twice a 2 ms step, the stiffest MuJoCo
+# recommends. Friction matters more: a quick-convert's unset friction is (1, 1, 1), and
+# torsional and rolling friction of 1.0 at a wall swallow the ball's spin. These are a
+# painted wood bumper's.
+WALL_SOLREF = take_param("wall_solref", [0.004, 0.3])
+WALL_FRICTION = take_param("wall_friction", [0.3, 0.001, 0.0001])
 
-WALL_H, WALL_T, RAIL_SINK = 8.4, 1.0, 2.0   # rails stand 8.4 cm above the green; walls start 2 cm under it
+WALL_H, WALL_T, RAIL_SINK = 8.4, 6.0, 2.0   # rails stand 8.4 cm above the green; walls start 2 cm under it.
+                                            # 6 cm thick, set OUTWARD so the inner face is on the measured line:
+                                            # a 1 cm wall let a 2.5 m/s ball drive past its mid-plane
 CUP_R, CUP_DEPTH, FLOOR_T = 5.4, 10.5, 20.0
 BALL_R = 2.135                              # a 42.7 mm ball, 45.9 g
 BALL_MASS = 0.0459
@@ -106,6 +125,25 @@ POLYLINES = {
                  [(-40, -40), (-20, -40), (-20, 40), (-40, 40)], [(40, -40), (20, -40), (20, 40), (40, 40)]],
 }
 POLYLINES["HoleRoundOpen"] = POLYLINES["HoleRound"]
+
+# The ball's intended centre line on each hole (cm), used only to decide which side of a
+# wall is "outward" (away from where the ball travels). It stands in for the keyed ball
+# path of a roll model that this repo does not have: hole 1 runs along +x to the cup,
+# hole 2 along +x to the bank then along -y to the cup, hole 3 along +x to the cup.
+CENTRE_LINES = {
+    1: [(10.0, Y), (X0 + 200, Y)],
+    2: [(10.0, Y), (X0 + 200, Y), (X0 + 200, Y - 200)],
+    3: [(10.0, Y), (X0 + 400, Y)],
+}
+
+
+def sample_polyline(pts, step=1.0):
+    out = []
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        n = max(1, int(math.hypot(bx - ax, by - ay) / step))
+        out += [(ax + (bx - ax) * i / n, ay + (by - ay) * i / n) for i in range(n)]
+    out.append(pts[-1])
+    return out
 
 
 def walls(kind, x, y, yaw=0.0):
@@ -173,7 +211,14 @@ def find_component(actor, cls):
     return None
 
 
-def box(label, center, size, yaw=0.0, friction=None):
+def vec3d(v):
+    out = unreal.Vector3d()                 # the property's struct takes no init args: set its fields
+    for k, val in zip(("x", "y", "z"), v):
+        out.set_editor_property(k, float(val))
+    return out
+
+
+def box(label, center, size, yaw=0.0, friction=None, solref=None):
     """A static, quick-converted box: the engine cube (100 cm, pivot centred) scaled to
     `size` cm and placed at `center`. Quick-convert is the right tool for walls and the
     green. It is the wrong tool for anything that must move or collide as a moving
@@ -187,11 +232,10 @@ def box(label, center, size, yaw=0.0, friction=None):
     a.set_actor_scale3d(unreal.Vector(size[0] / 100.0, size[1] / 100.0, size[2] / 100.0))
     qc = add_component(a, unreal.MjQuickConvertComponent, "MjQuickConvert")
     qc.set_editor_property("static", True)
-    if friction is not None:
-        v = unreal.Vector3d()                 # the property's struct takes no init args: set its fields
-        for k, val in zip(("x", "y", "z"), friction):
-            v.set_editor_property(k, float(val))
-        qc.set_editor_property("friction", v)
+    # Unset, the quick-convert's friction is (1, 1, 1); default to the wall friction.
+    qc.set_editor_property("friction", vec3d(friction if friction is not None else WALL_FRICTION))
+    if solref is not None:
+        qc.set_editor_property("solref", vec3d(list(solref) + [0.0]))
     return a
 
 
@@ -232,6 +276,12 @@ print("[map] authoring into %s -> %s" % (world.get_path_name(), MAP))
 # Exactly one manager: AMjManager::GetManager() resolves globally.
 manager = ell.spawn_actor_from_class(unreal.AMjManager, unreal.Vector(0, 0, 0))
 manager.set_actor_label("MjManager")
+if TIMESTEP:
+    # At the default 0.002 s a 2 m/s strike closes 4 mm per step, so the launch depends on
+    # where the step lands in the contact.
+    opt = manager.get_editor_property("scene_option")
+    opt.set_editor_property("timestep", float(TIMESTEP))
+    print("[map] timestep", TIMESTEP)
 
 # No default pawn. The project's default game mode spawns a chair and a crowd
 # character, and a pawn with an end-effector controller would also rewrite the arm's
@@ -280,14 +330,18 @@ g, L = CUP_R, 3000.0
 for lab, x0, x1, y0, y1 in (("Green_W", -L, cx - g, -L, L), ("Green_E", cx + g, L, -L, L),
                             ("Green_S", cx - g, cx + g, -L, cy - g), ("Green_N", cx - g, cx + g, cy + g, L)):
     box(lab, ((x0 + x1) / 2, (y0 + y1) / 2, -FLOOR_T / 2), (x1 - x0, y1 - y0, FLOOR_T), friction=FRICTION)
-box("Cup_Floor", (cx, cy, -CUP_DEPTH - 1.0), (2 * g + 2, 2 * g + 2, 2.0), friction=FRICTION)
-for lab, c, s in (("Cup_N", (cx, cy + g + 0.5, -CUP_DEPTH / 2), (2 * g, 1.0, CUP_DEPTH)),
-                  ("Cup_S", (cx, cy - g - 0.5, -CUP_DEPTH / 2), (2 * g, 1.0, CUP_DEPTH)),
-                  ("Cup_E", (cx + g + 0.5, cy, -CUP_DEPTH / 2), (1.0, 2 * g + 2, CUP_DEPTH)),
-                  ("Cup_W", (cx - g - 0.5, cy, -CUP_DEPTH / 2), (1.0, 2 * g + 2, CUP_DEPTH))):
-    box(lab, c, s)
+box("Cup_Floor", (cx, cy, -CUP_DEPTH - 1.0), (2 * g + 2 * WALL_T, 2 * g + 2 * WALL_T, 2.0),
+    friction=FRICTION, solref=WALL_SOLREF)
+# the liner boxes are thick and sit outside the cup radius
+for lab, c, s in (("Cup_N", (cx, cy + g + WALL_T / 2, -CUP_DEPTH / 2), (2 * g, WALL_T, CUP_DEPTH)),
+                  ("Cup_S", (cx, cy - g - WALL_T / 2, -CUP_DEPTH / 2), (2 * g, WALL_T, CUP_DEPTH)),
+                  ("Cup_E", (cx + g + WALL_T / 2, cy, -CUP_DEPTH / 2), (WALL_T, 2 * g + 2 * WALL_T, CUP_DEPTH)),
+                  ("Cup_W", (cx - g - WALL_T / 2, cy, -CUP_DEPTH / 2), (WALL_T, 2 * g + 2 * WALL_T, CUP_DEPTH))):
+    box(lab, c, s, solref=WALL_SOLREF)
 
-# The walls: every tile's wall lines as thin static boxes along the segments.
+# The walls: every tile's wall lines as thick static boxes whose inner face lies on the
+# measured segment. "Outward" is away from the ball's centre line on this hole.
+path = sample_polyline(CENTRE_LINES[HOLE])
 n = 0
 for kind, x, y, yaw, lab in HOLES[HOLE]["tiles"]:
     for (ax, ay), (bx, by) in walls(kind, x, y, yaw):
@@ -295,8 +349,14 @@ for kind, x, y, yaw, lab in HOLES[HOLE]["tiles"]:
         if ln < 0.5:
             continue
         n += 1
-        box("Wall_%s_%d" % (lab, n), ((ax + bx) / 2, (ay + by) / 2, (WALL_H - RAIL_SINK) / 2),
-            (ln + WALL_T, WALL_T, WALL_H + RAIL_SINK), yaw=math.degrees(math.atan2(by - ay, bx - ax)))
+        mx, my = (ax + bx) / 2, (ay + by) / 2
+        nx, ny = -(by - ay) / ln, (bx - ax) / ln
+        px, py = min(path, key=lambda q: math.hypot(q[0] - mx, q[1] - my))
+        if (px - mx) * nx + (py - my) * ny > 0:          # the path is on the +n side: outward is -n
+            nx, ny = -nx, -ny
+        box("Wall_%s_%d" % (lab, n), (mx + nx * WALL_T / 2, my + ny * WALL_T / 2, (WALL_H - RAIL_SINK) / 2),
+            (ln + WALL_T, WALL_T, WALL_H + RAIL_SINK), yaw=math.degrees(math.atan2(by - ay, bx - ax)),
+            solref=WALL_SOLREF)
 print("[map] walls:", n)
 
 # The ball: an articulation of its own, built from components (the newton test's
@@ -320,6 +380,9 @@ ball_geom.set_editor_property("mass", BALL_MASS)
 ball_geom.set_editor_property("condim", 6)                  # sliding + torsional + rolling friction
 ball_geom.set_editor_property("friction", list(FRICTION))
 ball_geom.set_editor_property("rgba", unreal.LinearColor(0.83, 0.02, 0.19, 1.0))
+if CONTACT:
+    for k, v in CONTACT.items():
+        ball_geom.set_editor_property(k, [float(x) for x in v])
 print("[map] ball articulation at", ball0)
 
 # The putter head: a child body of the Gen3's bracelet_link with a box geom, so it is
@@ -345,6 +408,9 @@ if PUTTER:
     head_geom.set_editor_property("mass", 0.35)
     head_geom.set_editor_property("friction", [0.6, 0.005, 0.0001])
     head_geom.set_editor_property("rgba", unreal.LinearColor(0.85, 0.85, 0.9, 1.0))
+    if CONTACT:
+        for k, v in CONTACT.items():
+            head_geom.set_editor_property(k, [float(x) for x in v])
     print("[map] putter head under", brace.get_name(), "at (MuJoCo m)", mj_pos(PUTTER["rel_pos"]))
 
 if not unreal.EditorLoadingAndSavingUtils.save_map(world, MAP):
@@ -372,4 +438,6 @@ if MAP.startswith("/Game/"):
 # One reply line for the host to parse.
 print("MINIGOLFMAP " + json.dumps({"ok": True, "map": MAP, "hole": HOLE, "mount": MOUNT, "base_yaw": BASE_YAW,
                                    "ball": ball0, "walls": n, "putter": bool(PUTTER),
-                                   "controllers_disabled": disabled, "ball_art": ball_art.get_name()}), flush=True)
+                                   "controllers_disabled": disabled, "ball_art": ball_art.get_name(),
+                                   "gen3_bp": GEN3_BP, "contact": CONTACT, "wall_solref": WALL_SOLREF,
+                                   "wall_friction": WALL_FRICTION, "timestep": TIMESTEP}), flush=True)

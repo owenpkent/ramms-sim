@@ -3,13 +3,17 @@ minigolf_op.py, one op per call, using Scripts/editor_remote_exec.py. Plain Pyth
 stdlib only. The editor must be open with Python Remote Execution enabled.
 
     python Scripts/pie_tests/minigolf/run_minigolf.py map [--hole 1] [--no-putter] [--friction 0.6,0.005,0.00135]
+            [--gen3-bp PATH] [--solref T,D] [--wall-solref T,D] [--wall-friction S,T,R] [--timestep S] [--putter FILE]
         author the level (PIE stopped) -> /Game/Maps/URL/Map_MiniGolf_URL
     python Scripts/pie_tests/minigolf/run_minigolf.py probe [--frame 72]
         start PIE, drive the arm to a stroke pose, print where the bracelet settles relative to the base
     python Scripts/pie_tests/minigolf/run_minigolf.py kick [--kick 1.41]
         launch the ball by its free joint's velocity and report the roll (the rolling-friction calibration)
-    python Scripts/pie_tests/minigolf/run_minigolf.py record
-        the putt: start PIE, approach, play the stroke from frame 72, record -> recordings/hole1 vN.json
+    python Scripts/pie_tests/minigolf/run_minigolf.py record [--hole 3 --chair 56,104,130 --sim-speed 50]
+        the putt: start PIE, approach, play the stroke from frame 72, record -> recordings/hole1 vN.json;
+        --chair v_cm_s,fa,fb slides the Gen3 along +x between frames fa and fb (needs the free-base Blueprint)
+    python Scripts/pie_tests/minigolf/run_minigolf.py fitputter [--aim-yaw D] [--out FILE]
+        bring the arm to the address pose and write the putter head's pose on the bracelet (data/putter_head.json)
     python Scripts/pie_tests/minigolf/run_minigolf.py stop
         end PIE
 
@@ -79,7 +83,18 @@ def build_map(a):
              "unreal._ramms_minigolf_base_yaw = %r" % a.base_yaw,
              "unreal._ramms_minigolf_friction = %r" % [float(v) for v in a.friction.split(",")]]
     if not a.no_putter:
-        setup.append("unreal._ramms_minigolf_putter = %r" % load_json("putter_head.json"))
+        setup.append("unreal._ramms_minigolf_putter = %r" % (json.loads(Path(a.putter).read_text(encoding="utf-8")) if a.putter
+                                                              else load_json("putter_head.json")))
+    if a.gen3_bp:
+        setup.append("unreal._ramms_minigolf_gen3_bp = %r" % a.gen3_bp)
+    if a.solref:
+        setup.append("unreal._ramms_minigolf_contact = %r" % {"solref": [float(v) for v in a.solref.split(",")]})
+    if a.wall_solref:
+        setup.append("unreal._ramms_minigolf_wall_solref = %r" % [float(v) for v in a.wall_solref.split(",")])
+    if a.wall_friction:
+        setup.append("unreal._ramms_minigolf_wall_friction = %r" % [float(v) for v in a.wall_friction.split(",")])
+    if a.timestep:
+        setup.append("unreal._ramms_minigolf_timestep = %r" % a.timestep)
     # The builder takes its parameters from attributes on `unreal`, so this is remote_code (arbitrary editor code) rather
     # than a one-string op.
     code = "import unreal; %s; exec(open(r'%s', encoding='utf-8').read())" % ("; ".join(setup), BUILD)
@@ -112,14 +127,17 @@ def record(a):
     start_pie(a.map)
     st = wait_ready()
     time.sleep(2.0)                                       # the control slots exist a moment after the sim reports ready
+    if a.sim_speed != 100:
+        print("[record] sim speed", op("speed %g" % a.sim_speed))
     q0 = [math.radians(d) for d in stroke_degrees(a.f0)]
     print("[record] ready at sim %.2f; moving to the frame %d pose over %g s" % (st["sim"], a.f0, a.approach))
     print("[record]", op("goto %g " % a.approach + " ".join("%.5f" % v for v in q0))["take_over"])
-    time.sleep(a.approach + 1.5)
+    time.sleep(a.approach * 100.0 / a.sim_speed + 1.5)    # the approach runs on the sim clock: slower sim, longer wait
     pose = op("pose")
     print("[record] at address: joints", pose["joints"], "bracelet", pose["bracelet"]["pos"])
     print("[record] bodies", op("headbody"))
-    print("[record]", op("play %s|%d|%d|%s" % (DATA / "stroke_hole1.json", a.f0, a.f1, out)))
+    chair = ("|" + a.chair.replace(",", "|")) if a.chair else ""
+    print("[record]", op("play %s|%d|%d|%s%s" % (DATA / "stroke_hole1.json", a.f0, a.f1, out, chair)))
     while True:
         time.sleep(1.0)
         pr = op("progress")
@@ -156,6 +174,56 @@ def kick(a):
         op("stop")
 
 
+def fitputter(a):
+    """Measure the putter head's pose on the bracelet: start PIE, bring the arm to the stroke's frame f0 pose, read the
+    bracelet, and express the stroke's planned putter transform at that frame (data/stroke_hole1.json "address_putter",
+    Unreal cm, chair space) in the bracelet's frame. The head box centre is 4 cm toward the toe and 76 cm down the shaft from
+    the putter's origin. --aim-yaw turns the face about world Z. Writes data/putter_head.json (or --out). Re-run after any
+    change to the address pose, then rebuild the map."""
+    def qmul(p, q):
+        x1, y1, z1, w1 = p
+        x2, y2, z2, w2 = q
+        return (w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2, w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2, w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2)
+
+    def qinv(q):
+        return (-q[0], -q[1], -q[2], q[3])
+
+    def qrot(q, v):
+        r = qmul(qmul(q, (v[0], v[1], v[2], 0.0)), qinv(q))
+        return (r[0], r[1], r[2])
+
+    start_pie(a.map)
+    wait_ready()
+    time.sleep(2.0)
+    q0 = [math.radians(d) for d in stroke_degrees(a.f0)]
+    op("goto %g " % a.approach + " ".join("%.5f" % v for v in q0))
+    time.sleep(a.approach + 1.5)
+    pose = op("pose")
+    pb, qb = tuple(pose["bracelet"]["pos"]), tuple(pose["bracelet"]["quat"])
+    fr = load_json("stroke_hole1.json")["address_putter"]
+    pp, qp = tuple(fr["loc"]), tuple(fr["quat"])
+    rel_q = qmul(qinv(qb), qp)
+    rel_p = qrot(qinv(qb), tuple(x - y for x, y in zip(pp, pb)))
+    head_local = (4.0, 0.0, -76.0)
+    head_rel_p = tuple(x + y for x, y in zip(rel_p, qrot(rel_q, head_local)))
+    h = math.radians(a.aim_yaw) / 2.0
+    aim = (0.0, 0.0, math.sin(h), math.cos(h))                       # a turn about world Z
+    aimed = qmul(qinv(qb), qmul(aim, qmul(qb, rel_q)))
+    spec = {"rel_pos": [round(v, 4) for v in head_rel_p], "rel_quat": [round(v, 6) for v in aimed], "size": [10.0, 2.5, 2.0],
+            "aim_yaw_deg": a.aim_yaw, "frame": a.f0, "bracelet": {"pos": pb, "quat": qb}, "joints": pose["joints"],
+            "note": "Putter head box relative to bracelet_link, measured at the stroke's frame %d pose (run_minigolf.py fitputter), "
+                    "the face yawed %.1f deg about world Z. rel_pos is Unreal cm in the bracelet's frame, rel_quat is Unreal "
+                    "(x, y, z, w), size is the full box size in cm." % (a.f0, a.aim_yaw)}
+    target = Path(a.out) if a.out else DATA / "putter_head.json"
+    target.write_text(json.dumps(spec, indent=1) + "\n", encoding="utf-8")
+    print("[fit] bracelet", [round(v, 1) for v in pb], "head rel", spec["rel_pos"], "head world check",
+          [round(v, 1) for v in tuple(x + y for x, y in zip(pb, qrot(qb, head_rel_p)))], "planned head", [round(v, 1) for v in fr["head"]])
+    print("[fit] wrote", target)
+    if not a.keep_pie:
+        op("stop")
+
+
 def summarize(rows):
     """What the ball did: where it started, when it first moved, its peak speed, where it ended; and the head's path.
     Rows are [sim_s, wall_s, frame, joints, bracelet xf, head xf, ball xf], xf = [x y z qx qy qz qw] in Unreal cm."""
@@ -183,12 +251,22 @@ def summarize(rows):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["map", "probe", "record", "kick", "stop"])
+    ap.add_argument("cmd", choices=["map", "probe", "fitputter", "record", "kick", "stop"])
     ap.add_argument("--hole", type=int, default=1, help="map: which hole to build (1-3); record names its file after it")
     ap.add_argument("--map", default=MAP, help="the level: map writes it, probe/record/kick start PIE on it")
     ap.add_argument("--base-yaw", type=float, default=-90.0, help="map: yaw of the Gen3 Blueprint at its mount, degrees")
     ap.add_argument("--no-putter", action="store_true", help="map: leave the putter head out")
     ap.add_argument("--friction", default="0.6,0.005,0.00135", help="map: green and ball friction slide,torsion,roll (MuJoCo units)")
+    ap.add_argument("--putter", help="map: a putter head JSON (default data/putter_head.json; data/putter_head_hole3.json aims +2.6 deg)")
+    ap.add_argument("--gen3-bp", default="", help="map: the Gen3 Blueprint (default the fixed base; /Game/Robots/URL/gen3_2f85 has the mocap-welded free base the chair-assist stroke needs)")
+    ap.add_argument("--solref", default="", help="map: ball and putter-head contact solref 'timeconst,dampratio' (MuJoCo's default 0.02,1 is critically damped)")
+    ap.add_argument("--wall-solref", default="", help="map: walls' contact solref 'timeconst,dampratio' (default 0.004,0.3)")
+    ap.add_argument("--wall-friction", default="", help="map: walls' friction 'slide,torsion,roll' (default 0.3,0.001,0.0001)")
+    ap.add_argument("--timestep", type=float, default=0.0, help="map: the MuJoCo model timestep in s (default 0.002)")
+    ap.add_argument("--aim-yaw", type=float, default=0.0, help="fitputter: yaw the face about world Z, degrees (+ turns the face toward +y)")
+    ap.add_argument("--out", default="", help="fitputter: write this file instead of data/putter_head.json")
+    ap.add_argument("--sim-speed", type=float, default=100.0, help="record: physics sim speed percent (50 halves the per-tick control and mocap steps)")
+    ap.add_argument("--chair", default="", help="record: 'v_cm_s,fa,fb': slide the arm's base along +x at v between frames fa and fb (the chair-assist stroke)")
     ap.add_argument("--f0", type=int, default=72, help="record: first stroke frame (the arm at address)")
     ap.add_argument("--f1", type=int, default=240, help="record: last stroke frame")
     ap.add_argument("--approach", type=float, default=3.0, help="record: seconds to ramp from the start pose to the frame f0 pose")
@@ -205,6 +283,8 @@ def main():
         record(a)
     elif a.cmd == "kick":
         kick(a)
+    elif a.cmd == "fitputter":
+        fitputter(a)
     else:
         probe(a)
 

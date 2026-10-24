@@ -13,7 +13,12 @@ The host leaves the op string on `unreal._minigolf_op` (it is consumed on read) 
     play <stroke.json>|<f0>|<f1>|<out.json>
                                      play a 24 fps joint stroke (degrees) from frame f0 to f1 on the sim clock and record
                                      every tick (see below); `progress` reports it and the file is written at the end
+                                     optional chair-assist fields: ...|<chair_v cm/s>|<fa>|<fb> slide the Gen3 actor along +x
+                                     at that speed between frames fa and fb (6-frame smoothstep ramps, on the sim clock); needs
+                                     the non-fixed Gen3 Blueprint, whose free base is welded to a mocap body that follows the actor
     progress                         samples so far, whether the play finished, the last frame
+    speed <percent>                  set the physics engine's sim_speed_percent (finer control updates per sim second) and report
+                                     whether the articulation is still bound
     kick <vx m/s> <seconds>          give the ball a velocity along +X by its free joint and sample it per tick
     kickresult                       the kick's samples, thinned, and the last one
     headbody                         the putter head's and the ball's body poses (checks both exist in the running sim)
@@ -249,16 +254,25 @@ elif op == "play":
     w = world()
     a = arm(w)
     m = unreal.AMjManager.get_manager()
-    tl_path, f0, f1, out_path = " ".join(args[1:]).split("|")          # paths may carry spaces: fields are |-separated
+    fields = " ".join(args[1:]).split("|")                              # paths may carry spaces: fields are |-separated
+    tl_path, f0, f1, out_path = fields[:4]
     f0, f1 = int(f0), int(f1)
+    # chair-assist: slide the Gen3 ACTOR along +x at chair_v cm/s between frames fa and fb. With the non-fixed Blueprint the base
+    # is a free body welded to a mocap base_target whose component follows the actor, so the whole arm rides the "chair"
+    chair_v, fa, fb = (float(fields[4]), float(fields[5]), float(fields[6])) if len(fields) >= 7 else (0.0, 0.0, 0.0)
+    chair_x0 = a.get_actor_location()
+    chair_pos = [0.0]
     tl = [[math.radians(d) for d in row] for row in json.load(open(tl_path, encoding="utf-8"))["frames"]]
     take_over(a)
     brace = a.get_body("bracelet_link")
     head = a.get_body("putter_head")
     _, ball = ball_body(w)
-    rec = {"format": "ramms-minigolf/1", "map": w.get_name(), "f0": f0, "f1": f1, "fps": 24, "stroke": tl_path,
-           "row": "[sim_s, wall_s, frame, j1..j7 (rad), bracelet xf, putter_head xf, ball xf]; xf = [x y z qx qy qz qw] UE world cm (MuJoCo bodies)",
-           "bodies": {"head": head is not None, "ball": ball is not None}, "samples": [], "done": False}
+    rec = {"format": "ramms-minigolf/2", "map": w.get_name(), "f0": f0, "f1": f1, "fps": 24, "stroke": tl_path,
+           "row": "[sim_s, wall_s, frame, j1..j7 (rad), bracelet xf, putter_head xf, ball xf, chair_x_cm, base_link xf]; "
+                  "xf = [x y z qx qy qz qw] UE world cm (MuJoCo bodies)",
+           "bodies": {"head": head is not None, "ball": ball is not None}, "samples": [], "done": False,
+           "chair": {"v_cm_s": chair_v, "fa": fa, "fb": fb},
+           "row_extra": "format 2 adds [7] chair x offset (cm, the actor's slide since the start of play), [8] base_link xf"}
     unreal._minigolf_rec = rec
     t0, w0 = m.get_sim_time(), time.perf_counter()
     handle = []
@@ -268,21 +282,37 @@ elif op == "play":
         p, q = t.translation, t.rotation
         return [round(p.x, 3), round(p.y, 3), round(p.z, 3), round(q.x, 6), round(q.y, 6), round(q.z, 6), round(q.w, 6)]
 
+    def chair_speed(fr):
+        if chair_v == 0.0 or fr < fa or fr > fb:
+            return 0.0
+        ramp = 6.0
+        s = min(1.0, (fr - fa) / ramp, (fb - fr) / ramp)
+        return chair_v * (3 * s * s - 2 * s * s * s)
+
+    last = [m.get_sim_time()]
+
     def tick(dt):
         try:
-            fr = f0 + (m.get_sim_time() - t0) * 24.0
+            now = m.get_sim_time()
+            fr = f0 + (now - t0) * 24.0
             i = min(int(math.floor(fr)), f1 - 1)
             u = min(1.0, max(0.0, fr - i))
             if fr >= f1:
                 i, u = f1 - 1, 1.0
             q = [tl[i][k] + (tl[i + 1][k] - tl[i][k]) * u for k in range(7)]
             set_ctrl(a, q)
+            v = chair_speed(fr)
+            if v:
+                chair_pos[0] += v * (now - last[0])
+                a.set_actor_location(unreal.Vector(chair_x0.x + chair_pos[0], chair_x0.y, chair_x0.z), False, False)
+            last[0] = now
             p, qq = brace.get_world_position(), brace.get_world_rotation()
-            row = [round(m.get_sim_time(), 5), round(time.perf_counter() - w0, 4), round(fr, 3),
+            row = [round(now, 5), round(time.perf_counter() - w0, 4), round(fr, 3),
                    [round(unreal.MjJointRuntime.get_position(a.get_joint(j)), 5) for j in JOINTS],
                    [round(p.x, 3), round(p.y, 3), round(p.z, 3), round(qq.x, 6), round(qq.y, 6), round(qq.z, 6), round(qq.w, 6)],
                    body_xf(head) if head is not None else None,
-                   body_xf(ball) if ball is not None else None]
+                   body_xf(ball) if ball is not None else None,
+                   round(chair_pos[0], 3), body_xf(a.get_body("base_link")) if a.get_body("base_link") else None]
             rec["samples"].append(row)
             if fr >= f1 + 24:          # a second of hold after the last frame, then stop
                 rec["done"] = True
@@ -301,6 +331,16 @@ elif op == "play":
     handle.append(unreal.register_slate_post_tick_callback(tick))
     unreal._minigolf_play = handle[0]
     common.out(TAG, {"playing": [f0, f1], "out": out_path, "bodies": rec["bodies"], "sim": round(t0, 3)})
+elif op == "speed":
+    # speed <percent>: the physics engine's sim_speed_percent (half speed = finer control updates and smaller mocap steps per
+    # editor tick). Reports whether the articulation is still bound afterwards (a property set during PIE can unbind: #76)
+    w = world()
+    m = unreal.AMjManager.get_manager()
+    eng = m.get_editor_property("physics_engine")
+    before = eng.get_editor_property("sim_speed_percent")
+    eng.set_editor_property("sim_speed_percent", float(args[1]))
+    time.sleep(0.3)
+    common.out(TAG, {"sim_speed_percent": eng.get_editor_property("sim_speed_percent"), "was": before, "bound": rel_pose(arm(w)).get("bound")})
 elif op == "progress":
     rec = getattr(unreal, "_minigolf_rec", None)
     m = unreal.AMjManager.get_manager()
