@@ -12,6 +12,9 @@ stdlib only. The editor must be open with Python Remote Execution enabled.
     python Scripts/pie_tests/minigolf/run_minigolf.py record [--hole 3 --chair 56,104,130 --sim-speed 50]
         the putt: start PIE, approach, play the stroke from frame 72, record -> recordings/hole1 vN.json;
         --chair v_cm_s,fa,fb slides the Gen3 along +x between frames fa and fb (needs the free-base Blueprint)
+    python Scripts/pie_tests/minigolf/run_minigolf.py twoputt --hole 2 --chair 60,104,130 --chair2 25,104,130 --sim-speed 50
+        a hole played as one recorded sequence of segments: putt, return the arm to its pose at frame 0, drive the Gen3 actor to
+        park beside the ball facing the cup, putt again -> recordings/hole2-twoputt vK.json (format ramms-minigolf/3)
     python Scripts/pie_tests/minigolf/run_minigolf.py fitputter [--aim-yaw D] [--out FILE]
         bring the arm to the address pose and write the putter head's pose on the bracelet (data/putter_head.json)
     python Scripts/pie_tests/minigolf/run_minigolf.py stop
@@ -37,6 +40,11 @@ REC = HERE / "recordings"
 MAP = "/Game/Maps/URL/Map_MiniGolf_URL"
 OP_VAR, OP_TAG = "_minigolf_op", "MINIGOLF"
 BUILD_TAG = "MINIGOLFMAP"
+# Duplicated from make_minigolf_map.py (HOLES[n]["cup"], the ball0 at (10, Y), and MOUNT), which runs inside the editor and
+# cannot be imported here: keep them in step. The sequence's drive needs them to park the arm's base beside the ball.
+CUPS = {1: (160.0, -95.0), 2: (160.0, -295.0), 3: (360.0, -95.0)}      # cm, X0 = -40, Y = -95
+BALL_OFFSET = (10.0, -95.0)                                          # the ball's start; also where it sits in the chair frame
+MOUNT = (-35.0, -8.0, 35.0)                                          # the Gen3 actor's mount, in the chair frame
 
 
 def op(cmd):
@@ -153,6 +161,55 @@ def record(a):
         op("stop")
 
 
+def twoputt(a):
+    """A hole as a two-putt, one recorded sequence (the `sequence` op): the chair-assisted first putt, the arm back to its
+    frame 0 pose, the chair (the Gen3 actor) driven to park beside the ball facing the cup, and the same stroke again with an
+    optional second slide (--chair2). Waits on `progress`, then prints each putt's ball start, end and z, and the drives.
+    -> recordings/hole<N>-twoputt vK.json."""
+    out = common.next_path(REC, "hole%d-twoputt" % a.hole)
+    REC.mkdir(exist_ok=True)
+    start_pie(a.map)
+    wait_ready()
+    time.sleep(2.0)
+    if a.sim_speed != 100:
+        print("[twoputt] sim speed", op("speed %g" % a.sim_speed))
+    q0 = [math.radians(d) for d in stroke_degrees(a.f0)]
+    op("goto %g " % a.approach + " ".join("%.5f" % v for v in q0))
+    time.sleep(a.approach * 100.0 / a.sim_speed + 1.5)
+    chair = [float(v) for v in a.chair.split(",")] if a.chair else None
+    chair2 = [float(v) for v in a.chair2.split(",")] if a.chair2 else None
+    spec = {"stroke": str(DATA / "stroke_hole1.json"),
+            "segments": [{"play": [a.f0, a.f1], "chair": chair, "hold": 12, "base_yaw": a.base_yaw},
+                         {"goto": 0, "seconds": 1.5},
+                         {"drive": "ball", "seconds": a.drive_seconds, "cup": list(CUPS[a.hole]), "ball_offset": list(BALL_OFFSET),
+                          "mount": list(MOUNT), "base_yaw": a.base_yaw, "hold_frame": 0},
+                         {"settle": 0.5},
+                         {"play": [a.f0, a.f1], "chair": chair2, "hold": 30, "base_yaw": a.base_yaw}]}
+    REC.mkdir(exist_ok=True)
+    spec_path = REC / "twoputt_spec.json"
+    spec_path.write_text(json.dumps(spec, indent=1), encoding="utf-8")
+    print("[twoputt]", op("sequence %s|%s" % (spec_path, out)))
+    while True:
+        time.sleep(1.0)
+        pr = op("progress")
+        if pr["done"]:
+            break
+    if pr["error"]:
+        raise SystemExit("sequence failed: %s" % pr["error"])
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    rows = rec["samples"]
+    print("[twoputt] %d samples over %.1f s of sim; drives: %s" % (len(rows), rows[-1][0] - rows[0][0],
+          [{k: [round(x, 1) for x in v] if isinstance(v, list) else v for k, v in d.items()} for d in rec.get("drives", [])]))
+    for seg in (0, 4):                                   # the two play segments
+        srows = [r for r in rows if r[9] == seg and r[6]]
+        if srows:
+            print("[twoputt] segment %d: ball %s -> %s (z %.1f), seq frames %.0f..%.0f" % (
+                seg, [round(v, 1) for v in srows[0][6][:3]], [round(v, 1) for v in srows[-1][6][:3]], srows[-1][6][2],
+                srows[0][2], srows[-1][2]))
+    if not a.keep_pie:
+        op("stop")
+
+
 def kick(a):
     """Launch the ball at --kick m/s down the lane (the free joint's velocity) on a fresh PIE and report the roll: the
     rolling-friction calibration. A free sphere given a pure linear velocity skids to 5/7 of it before it rolls."""
@@ -251,7 +308,7 @@ def summarize(rows):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["map", "probe", "fitputter", "record", "kick", "stop"])
+    ap.add_argument("cmd", choices=["map", "probe", "fitputter", "record", "twoputt", "kick", "stop"])
     ap.add_argument("--hole", type=int, default=1, help="map: which hole to build (1-3); record names its file after it")
     ap.add_argument("--map", default=MAP, help="the level: map writes it, probe/record/kick start PIE on it")
     ap.add_argument("--base-yaw", type=float, default=-90.0, help="map: yaw of the Gen3 Blueprint at its mount, degrees")
@@ -267,6 +324,8 @@ def main():
     ap.add_argument("--out", default="", help="fitputter: write this file instead of data/putter_head.json")
     ap.add_argument("--sim-speed", type=float, default=100.0, help="record: physics sim speed percent (50 halves the per-tick control and mocap steps)")
     ap.add_argument("--chair", default="", help="record: 'v_cm_s,fa,fb': slide the arm's base along +x at v between frames fa and fb (the chair-assist stroke)")
+    ap.add_argument("--chair2", default="", help="twoputt: 'v_cm_s,fa,fb' slide on the SECOND putt (along the parked chair's heading)")
+    ap.add_argument("--drive-seconds", type=float, default=4.0, help="twoputt: how long the chair takes to park beside the ball")
     ap.add_argument("--f0", type=int, default=72, help="record: first stroke frame (the arm at address)")
     ap.add_argument("--f1", type=int, default=240, help="record: last stroke frame")
     ap.add_argument("--approach", type=float, default=3.0, help="record: seconds to ramp from the start pose to the frame f0 pose")
@@ -281,6 +340,8 @@ def main():
         build_map(a)
     elif a.cmd == "record":
         record(a)
+    elif a.cmd == "twoputt":
+        twoputt(a)
     elif a.cmd == "kick":
         kick(a)
     elif a.cmd == "fitputter":

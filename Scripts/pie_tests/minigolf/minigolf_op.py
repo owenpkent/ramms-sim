@@ -19,6 +19,7 @@ The host leaves the op string on `unreal._minigolf_op` (it is consumed on read) 
     progress                         samples so far, whether the play finished, the last frame
     speed <percent>                  set the physics engine's sim_speed_percent (finer control updates per sim second) and report
                                      whether the articulation is still bound
+    sequence <spec.json>|<out.json>  one recording of several segments on the sim clock (see the op): play / goto / drive / settle
     kick <vx m/s> <seconds>          give the ball a velocity along +X by its free joint and sample it per tick
     kickresult                       the kick's samples, thinned, and the last one
     headbody                         the putter head's and the ball's body poses (checks both exist in the running sim)
@@ -331,6 +332,139 @@ elif op == "play":
     handle.append(unreal.register_slate_post_tick_callback(tick))
     unreal._minigolf_play = handle[0]
     common.out(TAG, {"playing": [f0, f1], "out": out_path, "bodies": rec["bodies"], "sim": round(t0, 3)})
+elif op == "sequence":
+    # sequence <spec.json>|<out.json>: one recording of several segments on the sim clock, for a hole played in more than one
+    # stroke. spec: {"stroke": <stroke json, degrees>, "segments": [...]} with segments
+    #   {"play": [f0, f1], "chair": [v_cm_s, fa, fb] | null, "hold": frames}   the stroke (stroke frames), optional chair slide
+    #   {"goto": stroke_frame, "seconds": s}                                     ramp the arm to a stroke pose (the carry)
+    #   {"drive": "ball", "seconds": s, "cup": [x, y], "ball_offset": [x, y], "mount": [x, y, z], "base_yaw": deg, "hold_frame": f}
+    #                                                   drive the chair (the Gen3 actor) to park beside the ball facing the cup
+    #   {"settle": s}
+    # Rows: [sim_s, wall_s, seq_frame, joints x7, bracelet xf, head xf, ball xf, actor (x, y, yaw), base xf, segment, local_frame]
+    spec_path, out_path = " ".join(args[1:]).split("|")
+    spec = json.load(open(spec_path, encoding="utf-8"))
+    tl = [[math.radians(d) for d in row] for row in json.load(open(spec["stroke"], encoding="utf-8"))["frames"]]
+    segs = spec["segments"]
+    w = world()
+    a = arm(w)
+    m = unreal.AMjManager.get_manager()
+    take_over(a)
+    brace, head = a.get_body("bracelet_link"), a.get_body("putter_head")
+    _, ball = ball_body(w)
+    rec = {"format": "ramms-minigolf/3", "map": w.get_name(), "fps": 24, "spec": spec, "samples": [], "done": False,
+           "row": "[sim_s, wall_s, seq_frame, j1..j7 (rad), bracelet xf, putter_head xf, ball xf, actor (x, y, yaw deg), base_link xf, segment, local stroke frame]"}
+    unreal._minigolf_rec = rec
+    t0 = m.get_sim_time()
+    w0 = time.perf_counter()
+    st = {"i": 0, "t_seg": t0, "start": None, "target": None, "q0": None, "last": t0, "chair_pos": 0.0}
+    handle = []
+
+    def rot2(x, y, deg):
+        c, s_ = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+        return x * c - y * s_, x * s_ + y * c
+
+    def actor_pose():
+        l, r = a.get_actor_location(), a.get_actor_rotation()
+        return [l.x, l.y, l.z, r.yaw]
+
+    def begin_segment(i, now):
+        st["i"], st["t_seg"], st["last"], st["chair_pos"] = i, now, now, 0.0
+        if i >= len(segs):
+            return
+        sg = segs[i]
+        st["start"] = actor_pose()
+        if "goto" in sg:
+            st["q0"] = [unreal.MjJointRuntime.get_position(a.get_joint(j)) for j in JOINTS]
+        if "drive" in sg:
+            # park beside the ball facing the cup: chair yaw from ball to cup, chair position so the ball sits at ball_offset
+            # in chair space, the actor (the arm's base) at mount in that chair frame
+            bp = ball.get_world_position()
+            cup, off, mnt = sg["cup"], sg["ball_offset"], sg["mount"]
+            cyaw = math.degrees(math.atan2(cup[1] - bp.y, cup[0] - bp.x))
+            ox, oy = rot2(off[0], off[1], cyaw)
+            cx, cy = bp.x - ox, bp.y - oy
+            mx, my = rot2(mnt[0], mnt[1], cyaw)
+            st["target"] = [cx + mx, cy + my, mnt[2], sg["base_yaw"] + cyaw]
+            rec.setdefault("drives", []).append({"segment": i, "ball": [bp.x, bp.y, bp.z], "chair": [cx, cy, cyaw], "actor": st["target"]})
+
+    begin_segment(0, t0)
+
+    def tick(dt):
+        try:
+            now = m.get_sim_time()
+            fr_seq = (now - t0) * 24.0
+            i = st["i"]
+            local = None
+            if i < len(segs):
+                sg = segs[i]
+                u_t = now - st["t_seg"]
+                if "play" in sg:
+                    f0, f1 = sg["play"]
+                    fr = f0 + u_t * 24.0
+                    local = fr
+                    k = min(int(math.floor(fr)), f1 - 1)
+                    u = min(1.0, max(0.0, fr - k))
+                    if fr >= f1:
+                        k, u = f1 - 1, 1.0
+                    set_ctrl(a, [tl[k][j] + (tl[k + 1][j] - tl[k][j]) * u for j in range(7)])
+                    ch = sg.get("chair")
+                    if ch and ch[1] <= fr <= ch[2]:
+                        ramp = 6.0
+                        s_ = min(1.0, (fr - ch[1]) / ramp, (ch[2] - fr) / ramp)
+                        v = ch[0] * (3 * s_ * s_ - 2 * s_ * s_ * s_)
+                        st["chair_pos"] += v * (now - st["last"])
+                        sx, sy, sz, syaw = st["start"]
+                        dx, dy = rot2(st["chair_pos"], 0.0, syaw - sg.get("base_yaw", -90.0))   # along the chair's +x
+                        a.set_actor_location(unreal.Vector(sx + dx, sy + dy, sz), False, False)
+                    if fr >= f1 + sg.get("hold", 24):
+                        begin_segment(i + 1, now)
+                elif "goto" in sg:
+                    u = min(1.0, u_t / sg["seconds"]) if sg["seconds"] > 0 else 1.0
+                    s_ = 3 * u * u - 2 * u * u * u
+                    q1 = tl[int(sg["goto"])]
+                    set_ctrl(a, [q0 + (q1_ - q0) * s_ for q0, q1_ in zip(st["q0"], q1)])
+                    if u >= 1.0:
+                        begin_segment(i + 1, now)
+                elif "drive" in sg:
+                    set_ctrl(a, tl[int(sg.get("hold_frame", 0))])
+                    u = min(1.0, u_t / sg["seconds"])
+                    s_ = 3 * u * u - 2 * u * u * u
+                    sx, sy, sz, syaw = st["start"]
+                    tx, ty, tz, tyaw = st["target"]
+                    dyaw = (tyaw - syaw + 180.0) % 360.0 - 180.0
+                    a.set_actor_location_and_rotation(unreal.Vector(sx + (tx - sx) * s_, sy + (ty - sy) * s_, sz),
+                                                      unreal.Rotator(0.0, 0.0, syaw + dyaw * s_), False, False)
+                    if u >= 1.0:
+                        begin_segment(i + 1, now)
+                elif "settle" in sg:
+                    if u_t >= sg["settle"]:
+                        begin_segment(i + 1, now)
+                st["last"] = now
+            p, qq = brace.get_world_position(), brace.get_world_rotation()
+            rec["samples"].append([round(now, 5), round(time.perf_counter() - w0, 4), round(fr_seq, 3),
+                                   [round(unreal.MjJointRuntime.get_position(a.get_joint(j)), 5) for j in JOINTS],
+                                   [round(p.x, 3), round(p.y, 3), round(p.z, 3), round(qq.x, 6), round(qq.y, 6), round(qq.z, 6), round(qq.w, 6)],
+                                   body_xf(head) if head is not None else None, body_xf(ball) if ball is not None else None,
+                                   [round(v, 3) for v in actor_pose()][:2] + [round(actor_pose()[3], 3)],
+                                   body_xf(a.get_body("base_link")) if a.get_body("base_link") else None,
+                                   st["i"], None if local is None else round(local, 3)])
+            if st["i"] >= len(segs):
+                rec["done"] = True
+                unreal.unregister_slate_post_tick_callback(handle[0])
+                unreal._minigolf_play = None
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(rec, f, separators=(",", ":"))
+        except Exception as e:
+            rec["error"] = repr(e)
+            rec["done"] = True
+            unreal.unregister_slate_post_tick_callback(handle[0])
+            unreal._minigolf_play = None
+    old = getattr(unreal, "_minigolf_play", None)
+    if old is not None:
+        unreal.unregister_slate_post_tick_callback(old)
+    handle.append(unreal.register_slate_post_tick_callback(tick))
+    unreal._minigolf_play = handle[0]
+    common.out(TAG, {"sequence": len(segs), "out": out_path, "sim": round(t0, 3)})
 elif op == "speed":
     # speed <percent>: the physics engine's sim_speed_percent (half speed = finer control updates and smaller mocap steps per
     # editor tick). Reports whether the articulation is still bound afterwards (a property set during PIE can unbind: #76)

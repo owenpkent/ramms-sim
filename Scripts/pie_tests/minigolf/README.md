@@ -19,7 +19,7 @@ data/stroke_hole1.json    the planned stroke: 241 frames x 7 joints, degrees, 24
                           putter transform at the address frame ("address_putter") that fitputter reads
 make_minigolf_map.py      the level builder (runs inside the editor)
 minigolf_op.py            the in-editor op, one op per call (runs inside the editor)
-run_minigolf.py           the host: map / probe / fitputter / kick / record / stop (uses ../common.py)
+run_minigolf.py           the host: map / probe / fitputter / kick / record / twoputt / stop (uses ../common.py)
 recordings/               per-tick recordings, numbered, gitignored
 ```
 
@@ -40,6 +40,9 @@ python Scripts/pie_tests/minigolf/run_minigolf.py stop
 python Scripts/pie_tests/minigolf/run_minigolf.py map --hole 3 --gen3-bp /Game/Robots/URL/gen3_2f85 \
     --putter Scripts/pie_tests/minigolf/data/putter_head_hole3.json
 python Scripts/pie_tests/minigolf/run_minigolf.py record --hole 3 --chair 56,104,130 --sim-speed 50
+
+# hole 2 as a two-putt, one recorded sequence (map built as for hole 3 with --hole 2; see "Hole 2 as a two-putt"):
+python Scripts/pie_tests/minigolf/run_minigolf.py twoputt --hole 2 --chair 60,104,130 --chair2 25,104,130 --sim-speed 50
 ```
 
 `map` takes `--hole 1|2|3`, `--friction slide,torsion,roll`, `--base-yaw`, `--map`, `--putter FILE`
@@ -48,7 +51,7 @@ and `--no-putter`, plus `--gen3-bp` (the Gen3 Blueprint; the default is the fixe
 `--solref T,D` (contact softness of the ball and the putter head), `--wall-solref T,D`,
 `--wall-friction slide,torsion,roll` and `--timestep S` (the model timestep). `record` takes
 `--chair v_cm_s,fa,fb` and `--sim-speed PERCENT` (the approach wait scales with it).
-`fitputter` takes `--aim-yaw DEGREES` and `--out FILE`. The map builder itself is parameterised through
+`twoputt` takes `--chair`, `--chair2` (the second putt's slide) and `--drive-seconds` (default 4). `fitputter` takes `--aim-yaw DEGREES` and `--out FILE`. The map builder itself is parameterised through
 `unreal._ramms_minigolf_*` attributes, consumed on read (listed in its docstring), so another level can reuse it.
 The stroke in `data/` was planned for hole 1's ball position and addresses the ball directly (the face 0.5 cm
 behind it). Holes 2 and 3 build and simulate with it; hole 3 needs the chair assist and its own aim (below).
@@ -126,8 +129,8 @@ carpet), so the chair-assist stroke is built in the sim and works.
 - **Hole 2 as laid out does not work.** 343 cm of path with a bank in it needs roughly three times the energy one assisted
   stroke has after the bank (the ball got 46 cm down the dogleg). Either shorten it (the corner one tile from the ball and
   the hole tile straight below the corner, about 145 cm of path, still marginal after the bank) or make it a two-putt:
-  the first putt banks and dies in the dogleg, the base is driven round the corner, and a second putt drops it. The
-  two-putt needs a second stroke with the base re-parked beside the ball; nothing here does that yet.
+  the first putt banks and dies in the dogleg, the base is driven round the corner, and a second putt drops it. See
+  "Hole 2 as a two-putt" below.
 - **Takes vary.** The sim is real time: control targets and the base slide update once per editor tick (48 to 55 Hz, or twice
   that in sim time at `--sim-speed 50`), so the strike lands at a slightly different phase each run. Hole 3 at the same
   settings: 352 (sunk), 387, 338, 327, 356 cm, and 5 to 15 cm of lateral wander. A finer model timestep (`--timestep 0.0005`)
@@ -136,6 +139,40 @@ carpet), so the chair-assist stroke is built in the sim and works.
   keep the one you want.
 - **Per-hole aim.** `fitputter --aim-yaw D --out FILE` writes a per-hole putter pose; hole 3 uses +2.6 degrees
   (`data/putter_head_hole3.json`), probably a degree too much now that the thick tunnel walls stopped the grazes.
+
+## Hole 2 as a two-putt
+
+`run_minigolf.py twoputt --hole 2 --chair 60,104,130 --chair2 25,104,130 --sim-speed 50` plays the hole as one recorded
+sequence (the `sequence` op, format `ramms-minigolf/3`) on a map built for hole 2 with the free-base Blueprint:
+
+1. The chair-assisted first putt (60 cm/s over frames 104 to 130) banks round the corner and dies in the dogleg at about
+   (183, -138).
+2. The arm returns to its frame 0 pose (`goto`, 1.5 s).
+3. The chair drives for 4 s and parks beside the ball facing the cup. The stroke is in chair space, so it is reused: the chair
+   yaw points from the ball to the cup, the chair position puts the ball at (10, -95) in chair space, and the Gen3 actor
+   (the arm's base) sits at the mount (-35, -8, 35) in that frame at base yaw -90 plus the chair yaw, interpolated with a
+   smoothstep while the arm holds the carry pose. The target is computed from the live ball position when the drive starts.
+4. The same stroke again. The second putt alone fell 26 cm short; with a 25 cm/s slide (`--chair2`) it rolled 155 cm into
+   the cup. One take: 522 frames, 21.8 s of sim.
+
+The cup comes from `CUPS`, and the ball offset and mount from `BALL_OFFSET` and `MOUNT`, in `run_minigolf.py`. They are
+duplicated from `make_minigolf_map.py` (its `HOLES` table, `ball0` and `MOUNT`), which runs inside the editor and cannot be
+imported, so keep them in step. The host waits on `progress`, then prints each putt's ball start, end and z and the drives.
+
+Segments in the spec (`recordings/twoputt_spec.json`, written by the host; `"stroke"` is the stroke file in degrees):
+
+- `{"play": [f0, f1], "chair": [v_cm_s, fa, fb] | null, "hold": frames, "base_yaw": deg}` the stroke, with an optional
+  slide along the chair's heading, then `hold` frames before the next segment.
+- `{"goto": stroke_frame, "seconds": s}` ramp the arm to a stroke frame's pose (smoothstep).
+- `{"drive": "ball", "seconds": s, "cup": [x, y], "ball_offset": [x, y], "mount": [x, y, z], "base_yaw": deg, "hold_frame": f}`
+  drive the Gen3 actor to park beside the ball facing the cup, the arm holding `hold_frame`.
+- `{"settle": s}` wait.
+
+Recording `ramms-minigolf/3`: `row` is `[sim_s, wall_s, seq_frame, j1..j7 (rad), bracelet xf, putter_head xf, ball xf,
+actor [x, y, yaw deg], base_link xf, segment, local stroke frame]`, where xf is `[x y z qx qy qz qw]` in Unreal world cm,
+`seq_frame` counts 24 fps frames from the start of the sequence, `segment` is the index into the spec's segments, and the
+local frame is the stroke frame during a `play` segment and null otherwise. The recording also carries the `spec` and a
+`drives` list, one entry per drive: `{"segment", "ball": [x, y, z], "chair": [x, y, yaw deg], "actor": [x, y, z, yaw]}`.
 
 ## Conventions
 
@@ -185,7 +222,7 @@ sign changes, and the level mounts the Blueprint at yaw -90.
 
 ## Open
 
-- Hole 2: shorten it, or make it a two-putt (above).
+- Hole 2 as laid out needs the two-putt (above); shortening it is the alternative.
 - Repeatable takes need fixed-step stepping (the bridge's Direct mode) or a per-substep mocap driver in C++.
 - The box face has a degree or two of loft at impact, so the ball hops about 2 mm and skids
   with backspin. A face with a measured loft is a one-line change.
