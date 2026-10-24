@@ -36,7 +36,9 @@ Engine 5.8 simulation environment for robotic assistive technologies.
     - [Renderer & Ray Tracing](#renderer--ray-tracing)
     - [Game Settings](#game-settings)
   - [Python Integration](#python-integration)
+    - [ramms-tools (Remote Control API)](#ramms-tools-remote-control-api)
   - [MCP Server (AI assistants in the editor)](#mcp-server-ai-assistants-in-the-editor)
+  - [World Generation (procedural, randomized environments)](#world-generation-procedural-randomized-environments)
     - [The RAMMS toolset](#the-ramms-toolset)
   - [URDF Interoperability](#urdf-interoperability)
   - [Example Environments](#example-environments)
@@ -408,6 +410,7 @@ git submodules:
 | **RammsControl** | `Plugins/RammsControl/` | Dependency-light control-surface model: how a robot describes its controls and how any input source drives them (no UMG, no physics) |
 | **RammsUI** | `Plugins/RammsUI/` | User interface components and tools |
 | **RammsPrivateAssets** | `Plugins/RammsPrivateAssets/` | Private content (lift-drive CAD meshes, MJCF-derived articulations, and the pawns, tables and test map built on them). Content only; enabled automatically when present |
+| **RammsWorldGen** | `Plugins/RammsWorldGen/` | Procedural, seed-driven pedestrian / wheelchair worlds on PCG (streets, parks, homes, offices, stores) with crowds and a ground-truth accessibility manifest ([ramms-worldgen](https://github.com/rammp-org/ramms-worldgen)); see [doc/world_generation.md](doc/world_generation.md) |
 
 An additional local plugin (**VolingaRenderer**) provides custom rendering
 capabilities.
@@ -420,7 +423,7 @@ Ramms/
 ├── Content/                 Blueprint assets, materials, meshes, levels
 │   ├── Blueprints/            Game logic (BP_MebotGameMode, etc.)
 │   ├── Maps/                  Game levels
-│   ├── Robots/                Robot actor blueprints (BP_Kinova_Gen3, BP_Mebot_Ramms)
+│   ├── Robots/                Robot actor blueprints (BP_Kinova_Gen3, BP_Mebot_Ramms; pawns: doc/robot_pawn.md)
 │   ├── Vehicles/              Vehicle variants (AdaptedVanRamp, IDBuzz, etc.)
 │   ├── ada_door/              Accessible door system
 │   ├── Fab/                   Downloaded Fab marketplace assets
@@ -604,8 +607,8 @@ global illumination. Key settings in `Config/DefaultEngine.ini`:
 
 ### Game Settings
 
-- **Default map:** `VehicleTemplate/Maps/VehicleBasic`
-- **Default game mode:** `BP_VehicleAdvGameMode`
+- **Default map:** `Maps/Map_Demo`
+- **Default game mode:** `BP_MebotGameMode` (pawn `BP_Mebot_Ramms`, controller `ARammsPlayerController`)
 - **Splitscreen:** Enabled (2-player horizontal, 3-player top-favored)
 
 ## Python Integration
@@ -624,6 +627,41 @@ Remote Execution is enabled in this project's settings (multicast
 239.0.0.1:6766, loopback). For another project, enable it under **Edit >
 Project Settings > Plugins > Python > Remote Execution > Enable Remote
 Execution**.
+
+`Scripts/editor_remote_exec.py` is a dependency-free client for that interface
+(`--code`, `--file`, `--eval`); the PIE test runners under
+`Plugins/RammsPrivateAssets/Scripts/` drive the editor through it.
+
+### Recording a run for video
+
+The physics backend does not run in real time under the Movie Render Queue, so
+to film a simulated behaviour, record it first and play the recording back in a
+Level Sequence afterwards. `Scripts/record_transforms.py` records every visible
+mesh on an actor each editor tick, keyed on the physics clock
+(`RammsRobotBaseComponent.GetSimulationTime`, `mjData.time` on the MuJoCo
+backend), plus the rest of the level's static meshes once, as one JSON file.
+Run it through `editor_remote_exec.py` while PIE is running, `begin <out.json>
+[<actor label>]` before the behaviour and `end` after it (the default actor is
+the first Pawn with a `RammsRobotBaseComponent`). The file's header documents
+the format. The playback side (clustering the meshes into their rigid bodies,
+keying a Level Sequence, rendering) is a consumer's concern; the first one is
+the curb negotiation video.
+### ramms-tools (Remote Control API)
+
+The sister repository [ramms-tools](https://github.com/rammp-org/ramms-tools)
+(`pip install -e ../ramms-tools`) is the supported way for programs and users
+to drive RAMMS from outside the editor. It talks to the engine's **Remote
+Control API** (HTTP port 30010, in the editor and in `-game` / packaged
+builds with the plugin) and ships a library plus CLIs: `ramms-kinova`,
+`ramms-mebot`, `ramms-gripper`, `ramms-pose`, `ramms-imu`, `ramms-stream`,
+`ramms-notify`, `ramms-status`, `ramms-tui`, and `ramms-worldgen` for
+[world generation](#world-generation-procedural-randomized-environments).
+
+UE 5.6+ refuses remote function calls unless they are allow-listed;
+`Config/DefaultRemoteControl.ini` lists the RAMMS bridges
+(`RammsCoreBridge`, `RammsRemoteBridge`, `RammsWorldGenBridge`), the robot
+controller components and the few engine getters the tools use. Add a line
+there when a new class needs to be callable remotely.
 
 ## MCP Server (AI assistants in the editor)
 
@@ -721,6 +759,30 @@ and the two agree by construction: the toolset wraps the same calls.
 > **Note:** Epic's plugin warns that data sent through it to an LLM service is
 > Licensed Technology under the UE EULA, and that you are responsible for
 > ensuring your provider does not train on it. See EULA section 6(e).
+
+## World Generation (procedural, randomized environments)
+
+The `RammsWorldGen` plugin generates pedestrian / wheelchair environments from
+a preset and a seed on UE 5.8 PCG — downtown streets with curb ramps and
+crosswalks, building entrances (level, stepped, ramped), street furniture and
+hazards, suburban lots and parks, and indoor floor plans with doors and
+furniture — and emits a ground-truth manifest of routes, clear widths and
+accessibility violations per world. `NonCompliance` dials how often features
+are generated broken on purpose.
+
+```
+python Scripts/editor_remote_exec.py --file Scripts/worldgen/build_assets.py   # palette, profile, presets, graphs from code
+python Scripts/editor_remote_exec.py --file Scripts/worldgen/build_levels.py   # Map_Gen_Downtown / Suburban / Park / Indoor / Office
+```
+
+Then open a `/Game/Maps/Gen/Map_Gen_*` level, pick a seed on `WorldGenerator`,
+**Regenerate**. The MCP server exposes it as the `RammsWorldGenToolset`
+(`worldgen_generate`, `worldgen_randomize`, `worldgen_manifest`, ...), and
+ramms-tools as `ramms-worldgen` / `ramms_tools.worldgen` (`ramms-worldgen
+generate --preset PRE_Downtown --seed 42`, `ramms-worldgen manifest --issues`,
+`ramms-worldgen batch --preset PRE_Park --seeds 1-50 --out data/park`).
+See [doc/world_generation.md](doc/world_generation.md) and
+`Plugins/RammsWorldGen/README.md`.
 
 ## URDF Interoperability
 

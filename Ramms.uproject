@@ -16,7 +16,7 @@
 			"Enabled": true
 		},
 		{
-			"Name": "ChaosVehiclesPlugin",
+			"Name": "MovieRenderPipeline",
 			"Enabled": true
 		},
 		{
@@ -125,6 +125,34 @@
 		},
 		{
 			"Name": "ModelContextProtocol",
+			"Enabled": true
+		},
+		{
+			"Name": "RammsWorldGen",
+			"Enabled": true
+		},
+		{
+			"Name": "MovieRenderPipeline",
+			"Enabled": true
+		},
+		{
+			"Name": "MoviePipelineMaskRenderPass",
+			"Enabled": true
+		},
+		{
+			"Name": "AccumulationDOF",
+			"Enabled": true
+		},
+		{
+			"Name": "CineCameraSceneCapture",
+			"Enabled": true
+		},
+		{
+			"Name": "USDCore",
+			"Enabled": true
+		},
+		{
+			"Name": "USDImporter",
 			"Enabled": true
 		}
 	]
